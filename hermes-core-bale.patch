@@ -1,0 +1,81 @@
+diff --git a/gateway/config_env.py b/gateway/config_env.py
+index fe564fc219..1a4f9a7804 100644
+--- a/gateway/config_env.py
++++ b/gateway/config_env.py
+@@ -226,7 +226,10 @@ def _enable_plugin_platform(config: GatewayConfig, entry) -> None:
+     if seed:  # commit the probe's env-seeded extras (env_enablement_fn is never called twice)
+         seed = dict(seed)
+         home = seed.pop("home_channel", None)
++        token = seed.pop("token", None)
+         platform_config.extra.update(seed)
++        if token and not platform_config.token:  # seed bridges env-only plugin credentials (Bale etc.)
++            platform_config.token = token
+         if isinstance(home, dict) and home.get("chat_id"):
+             platform_config.home_channel = HomeChannel(
+                 platform=platform, chat_id=str(home["chat_id"]), name=str(home.get("name") or "Home"),
+diff --git a/tools/send_message_senders.py b/tools/send_message_senders.py
+index e887fc492d..d776486426 100644
+--- a/tools/send_message_senders.py
++++ b/tools/send_message_senders.py
+@@ -106,19 +106,38 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
+ 
+ 
+ def _telegram_bot(token):
+-    """Bot honouring TELEGRAM_PROXY (standalone sends time out where api.telegram.org is
+-    blocked); falls back to a direct connection."""
++    """Bot honouring TELEGRAM_PROXY / BALE_PROXY; falls back to a direct connection."""
+     from telegram import Bot
++    from os import environ as _env
++    from gateway.platforms.base import resolve_proxy_url
++    from telegram.request import HTTPXRequest
++
++    bale_token = str(_env.get("BALE_BOT_TOKEN", "")).strip()
++    is_bale = bool(bale_token and token == bale_token)
++    base_url = "https://tapi.bale.ai/bot" if is_bale else None
++    proxy_var = "BALE_PROXY" if is_bale else "TELEGRAM_PROXY"
++    targets = ["tapi.bale.ai"] if is_bale else ["api.telegram.org"]
++
+     try:
+-        from gateway.platforms.base import resolve_proxy_url
+-        proxy = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
+-        if not proxy:
+-            return Bot(token=token)
+-        from telegram.request import HTTPXRequest
+-        logger.info("send_message: standalone Telegram send routed through proxy %s", proxy)
+-        return Bot(token=token, request=HTTPXRequest(proxy=proxy), get_updates_request=HTTPXRequest(proxy=proxy))
++        proxy = resolve_proxy_url(proxy_var, target_hosts=targets)
++        req = HTTPXRequest(proxy=proxy) if proxy else None
++        if proxy:
++            label = "Bale" if is_bale else "Telegram"
++            logger.info("send_message: standalone %s send routed through proxy %s", label, proxy)
++        kwargs = {}
++        if base_url:
++            kwargs["base_url"] = base_url
++            kwargs["base_file_url"] = base_url
++        if req:
++            kwargs["request"] = req
++            kwargs["get_updates_request"] = req
++        return Bot(token=token, **kwargs)
+     except Exception as proxy_err:
+-        logger.warning("send_message: failed to attach Telegram proxy (%s), falling back to direct connection", proxy_err)
++        label = "Bale" if is_bale else "Telegram"
++        logger.warning("send_message: failed to attach %s proxy (%s), falling back to direct connection", label, proxy_err)
++
++    if base_url:
++        return Bot(token=token, base_url=base_url, base_file_url=base_url)
+     return Bot(token=token)
+ 
+ 
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index 4f7c037190..ca96bc839a 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -698,7 +698,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
+         return await _send_plugin_standalone(platform_name, pconfig, chat_id, message, [message], media_files,
+                                              thread_id=thread_id, max_len=None, force_document=force_document)
+     # Telegram chunks internally on the *formatted* text (escaping inflates length).
+-    if platform == Platform.TELEGRAM:
++    if platform == Platform.TELEGRAM or platform_name == "bale":
+         return await _send_telegram(
+             pconfig.token, chat_id, message, media_files=media_files, thread_id=thread_id, force_document=force_document,
+             disable_link_previews=bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")))
