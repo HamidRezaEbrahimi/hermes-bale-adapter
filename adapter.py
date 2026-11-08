@@ -7222,18 +7222,18 @@ def _is_connected(config) -> bool:
     return bool(str(token).strip())
 
 
-async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
-    """Out-of-process delivery (standalone_sender_fn) so deliver=telegram cron jobs succeed without the
-    gateway; delegates to the REST ``_send_telegram`` sender."""
+async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False, caption=None):
+    """Out-of-process delivery (standalone_sender_fn) for Bale messenger."""
     token = getattr(pconfig, "token", None)
     if not token:
         from agent.secret_scope import get_secret  # profile-scoped: never borrow another profile's token
         token = get_secret("BALE_BOT_TOKEN", "") or ""
     disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
-    from tools.send_message_tool import _send_telegram
+    from tools.send_message_senders import _send_telegram
     return await _send_telegram(
         token, chat_id, message, media_files=media_files, thread_id=thread_id,
-        disable_link_previews=disable_link_previews, force_document=force_document)
+        disable_link_previews=disable_link_previews, force_document=force_document,
+        base_url="https://tapi.bale.ai/bot", proxy_var="BALE_PROXY", target_hosts=["tapi.bale.ai"])
 
 
 def interactive_setup() -> None:
@@ -7322,10 +7322,13 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
+    from gateway.platforms.send_targets import StandaloneSendPolicy
     ctx.register_platform(
         name="bale", label="Bale", adapter_factory=_build_adapter, check_fn=telegram_deps_present,
         ensure_deps_fn=check_telegram_requirements, is_connected=_is_connected, required_env=["BALE_BOT_TOKEN"],
         install_hint="Edit .env: set BALE_BOT_TOKEN (from @BaleBotFather inside Bale).", setup_fn=interactive_setup, apply_yaml_config_fn=_apply_yaml_config,
         env_enablement_fn=_env_enablement,
         allowed_users_env="BALE_ALLOWED_USERS", allow_all_env="BALE_ALLOW_ALL_USERS", cron_deliver_env_var="BALE_HOME_CHANNEL",
-        standalone_sender_fn=_standalone_send, max_message_length=4096, emoji="🟢", allow_update_command=True)
+        standalone_sender_fn=_standalone_send,
+        standalone_send=StandaloneSendPolicy(label="Bale", media=True, captionable=True, text_direct=True, forward_force_document=True),
+        max_message_length=4096, emoji="🟢", allow_update_command=True)

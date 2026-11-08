@@ -1,39 +1,86 @@
 diff --git a/gateway/config_env.py b/gateway/config_env.py
-index fe564fc219..1a4f9a7804 100644
+index fe564fc219..6d9bb5cd0a 100644
 --- a/gateway/config_env.py
 +++ b/gateway/config_env.py
-@@ -226,7 +226,10 @@ def _enable_plugin_platform(config: GatewayConfig, entry) -> None:
+@@ -226,7 +226,13 @@ def _enable_plugin_platform(config: GatewayConfig, entry) -> None:
      if seed:  # commit the probe's env-seeded extras (env_enablement_fn is never called twice)
          seed = dict(seed)
          home = seed.pop("home_channel", None)
 +        token = seed.pop("token", None)
++        api_key = seed.pop("api_key", None)
          platform_config.extra.update(seed)
-+        if token and not platform_config.token:  # seed bridges env-only plugin credentials (Bale etc.)
++        if token and not platform_config.token:
 +            platform_config.token = token
++        if api_key and not platform_config.api_key:
++            platform_config.api_key = api_key
          if isinstance(home, dict) and home.get("chat_id"):
              platform_config.home_channel = HomeChannel(
                  platform=platform, chat_id=str(home["chat_id"]), name=str(home.get("name") or "Home"),
+diff --git a/tests/gateway/test_platform_env_overrides.py b/tests/gateway/test_platform_env_overrides.py
+index be992ddaef..883ff91c29 100644
+--- a/tests/gateway/test_platform_env_overrides.py
++++ b/tests/gateway/test_platform_env_overrides.py
+@@ -40,3 +40,40 @@ def test_env_override_secrets_stay_in_terminal_secret_blocklist():
+                if name.upper().endswith(PLATFORM_SECRET_ENV_SUFFIXES)}
+     assert "WEIXIN_TOKEN" in secrets  # the rows were actually read
+     assert sorted(secrets - _ADAPTER_SECRET_ENV) == []
++
++
++def test_enable_plugin_platform_sets_token_and_api_key():
++    """_enable_plugin_platform must bridge env-seeded token/api_key onto PlatformConfig."""
++    from gateway.config import GatewayConfig, PlatformConfig, Platform
++    from gateway.config_env import _enable_plugin_platform
++    from gateway.platform_registry import platform_registry, PlatformEntry
++
++    entry_name = "test_custom_creds_platform"
++    # Register temporary entry in platform_registry so Platform(entry_name) accepts it
++    entry = PlatformEntry(
++        name=entry_name,
++        label="Test Platform",
++        adapter_factory=lambda cfg: None,
++        check_fn=lambda: True,
++        env_enablement_fn=lambda: {
++            "token": "test-token-xyz",
++            "api_key": "test-api-key-123",
++            "home_channel": {"chat_id": "998877", "name": "TestHome"},
++        },
++    )
++    platform_registry.register(entry)
++    try:
++        cfg = GatewayConfig()
++        _enable_plugin_platform(cfg, entry)
++
++        plat = Platform(entry.name)
++        pcfg = cfg.platforms.get(plat)
++        assert pcfg is not None
++        assert pcfg.enabled is True
++        assert pcfg.token == "test-token-xyz"
++        assert pcfg.api_key == "test-api-key-123"
++        assert pcfg.home_channel is not None
++        assert pcfg.home_channel.chat_id == "998877"
++    finally:
++        platform_registry._entries.pop(entry_name, None)
++
 diff --git a/tools/send_message_senders.py b/tools/send_message_senders.py
-index e887fc492d..d776486426 100644
+index e887fc492d..904ae16dfd 100644
 --- a/tools/send_message_senders.py
 +++ b/tools/send_message_senders.py
-@@ -106,19 +106,38 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
+@@ -105,20 +105,34 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
+     return "thread not found" in str(error).lower()
  
  
- def _telegram_bot(token):
+-def _telegram_bot(token):
 -    """Bot honouring TELEGRAM_PROXY (standalone sends time out where api.telegram.org is
 -    blocked); falls back to a direct connection."""
-+    """Bot honouring TELEGRAM_PROXY / BALE_PROXY; falls back to a direct connection."""
++def _telegram_bot(token, base_url=None, proxy_var=None, target_hosts=None):
++    """Bot honouring TELEGRAM_PROXY (or custom proxy_var/base_url); falls back to a direct connection."""
      from telegram import Bot
 +    from os import environ as _env
 +    from gateway.platforms.base import resolve_proxy_url
 +    from telegram.request import HTTPXRequest
 +
-+    bale_token = str(_env.get("BALE_BOT_TOKEN", "")).strip()
-+    is_bale = bool(bale_token and token == bale_token)
-+    base_url = "https://tapi.bale.ai/bot" if is_bale else None
-+    proxy_var = "BALE_PROXY" if is_bale else "TELEGRAM_PROXY"
-+    targets = ["tapi.bale.ai"] if is_bale else ["api.telegram.org"]
++    proxy_var = proxy_var or "TELEGRAM_PROXY"
++    targets = target_hosts or ["api.telegram.org"]
 +
      try:
 -        from gateway.platforms.base import resolve_proxy_url
@@ -46,8 +93,7 @@ index e887fc492d..d776486426 100644
 +        proxy = resolve_proxy_url(proxy_var, target_hosts=targets)
 +        req = HTTPXRequest(proxy=proxy) if proxy else None
 +        if proxy:
-+            label = "Bale" if is_bale else "Telegram"
-+            logger.info("send_message: standalone %s send routed through proxy %s", label, proxy)
++            logger.info("send_message: standalone send routed through proxy %s", proxy)
 +        kwargs = {}
 +        if base_url:
 +            kwargs["base_url"] = base_url
@@ -58,24 +104,24 @@ index e887fc492d..d776486426 100644
 +        return Bot(token=token, **kwargs)
      except Exception as proxy_err:
 -        logger.warning("send_message: failed to attach Telegram proxy (%s), falling back to direct connection", proxy_err)
-+        label = "Bale" if is_bale else "Telegram"
-+        logger.warning("send_message: failed to attach %s proxy (%s), falling back to direct connection", label, proxy_err)
++        logger.warning("send_message: failed to attach proxy (%s), falling back to direct connection", proxy_err)
 +
 +    if base_url:
 +        return Bot(token=token, base_url=base_url, base_file_url=base_url)
      return Bot(token=token)
  
  
-diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
-index 4f7c037190..ca96bc839a 100644
---- a/tools/send_message_tool.py
-+++ b/tools/send_message_tool.py
-@@ -698,7 +698,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
-         return await _send_plugin_standalone(platform_name, pconfig, chat_id, message, [message], media_files,
-                                              thread_id=thread_id, max_len=None, force_document=force_document)
-     # Telegram chunks internally on the *formatted* text (escaping inflates length).
--    if platform == Platform.TELEGRAM:
-+    if platform == Platform.TELEGRAM or platform_name == "bale":
-         return await _send_telegram(
-             pconfig.token, chat_id, message, media_files=media_files, thread_id=thread_id, force_document=force_document,
-             disable_link_previews=bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")))
+@@ -256,11 +270,11 @@ def _telegram_format(message):
+         return message, ParseMode.MARKDOWN_V2, False  # formatting unavailable: send as-is
+ 
+ 
+-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
++async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, base_url=None, proxy_var=None, target_hosts=None):
+     """One-shot Telegram Bot API send; parse failures fall back to plain text."""
+     try:
+         formatted, send_parse_mode, _has_html = _telegram_format(message)
+-        bot = _telegram_bot(token)
++        bot = _telegram_bot(token, base_url=base_url, proxy_var=proxy_var, target_hosts=target_hosts)
+         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+         from gateway.platforms.base import BasePlatformAdapter, utf16_len
+         # Telegram accepts a numeric chat_id OR an @username string; never force-int.
